@@ -22,6 +22,14 @@ message StockDeductLackedEvent {
   int64 checked_dt = 3;
 }
 
+// 재고 확인 응답 이벤트
+message StockCheckResponseEvent {
+  string order_uuid = 1;
+  bool available = 2;
+  repeated LackedItems lacked_items = 3;
+  int64 checked_dt = 4;
+}
+
 // 재고 복구 이벤트
 message StockRestoredEvent {
   string order_uuid = 1;

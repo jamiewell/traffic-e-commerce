@@ -3,15 +3,13 @@ package com.ecommerce.order.orderService;
 import com.ecommerce.order.dto.orderRequest.OrderCreateRequest;
 import com.ecommerce.order.dto.orderResponse.OrderItemResponse;
 import com.ecommerce.order.dto.orderResponse.OrderResponse;
+import com.ecommerce.order.event.OrderEventPublisher;
 import com.ecommerce.order.orderEntity.Order;
-import com.ecommerce.order.orderEntity.OrderItem;
 import com.ecommerce.order.orderRepository.OrderRepository;
-import com.ecommerce.proto.OrderCreatedEvent;
-import com.ecommerce.proto.OrderCreatedItem;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -23,9 +21,10 @@ import java.util.UUID;
 public class OrderService {
 
     private final OrderRepository orderRepository;
-    private final KafkaTemplate<String, byte[]> kafkaTemplate;
+    private final OrderEventPublisher orderEventPublisher;
 
 
+    @Transactional
     public OrderResponse createOrder(UUID userId, OrderCreateRequest request) {
 
 
@@ -36,34 +35,35 @@ public class OrderService {
         Order createdOrder = Order.of(userId, request, totalPrice, request.getItems());
         Order savedOrder = orderRepository.save(createdOrder);
 
-        // 카프카 메세지 ProtoBuf 직렬화
-        byte[] eventByte = toCreateOrderProtoBuf(savedOrder);
-        kafkaTemplate.send("order-events", "order.created", eventByte);
+        orderEventPublisher.publishOrderCreated(savedOrder);
 
 
         return buildResponse(savedOrder);
     }
 
+    @Transactional(readOnly = true)
     public OrderResponse getOrderDetail(UUID orderUUID) {
         Order order = orderRepository.findByOrderUUID(orderUUID).orElseThrow(() -> new IllegalArgumentException("Cannot find order"));
         return buildResponse(order);
     }
 
+    @Transactional(readOnly = true)
     public List<OrderResponse> getOrderListByUser(UUID userId) {
         return orderRepository.findAllByUserId(userId).stream().map(this::buildResponse).toList();
     }
 
+    @Transactional
     public OrderResponse cancelOrder(UUID orderUUID) {
         Order order = orderRepository.findByOrderUUID(orderUUID).orElseThrow(() -> new IllegalArgumentException("Cannot find order"));
+        if (!order.getStatus().isCancellableByUser()) {
+            throw new IllegalStateException("Cannot cancel order : status=" + order.getStatus());
+        }
 
-        // 주문 상태만 변경
+        // 보상은 오케스트레이터가 order.cancelled 수신 후 처리
         order.cancel();
-        Order cancelledOrder = orderRepository.save(order);
+        orderEventPublisher.publishOrderCancelled(orderUUID);
 
-        byte[] eventByte = toCreateOrderProtoBuf(cancelledOrder);
-        kafkaTemplate.send("order-events", "order.cancelled", eventByte);
-
-        return buildResponse(cancelledOrder);
+        return buildResponse(order);
     }
 
 
@@ -84,27 +84,6 @@ public class OrderService {
                 .build();
     }
 
-    private byte[] toCreateOrderProtoBuf(Order order) {
-        var protoBuilder = OrderCreatedEvent.newBuilder()
-                .setOrderUUID(order.getOrderUUID().toString())
-                .setUserId(order.getUserId().toString())
-                .setAddress(order.getAddress())
-                .setContact(order.getContact())
-                .setTotalPrice(order.getTotalPrice().doubleValue())
-                .setStatus(order.getStatus().name());
-
-
-        for (OrderItem item : order.getOrderItems()) {
-            protoBuilder.addItems(
-                    OrderCreatedItem.newBuilder()
-                            .setProductUUID(item.getProductUUID().toString())
-                            .setQuantity(item.getQuantity())
-                            .setPrice(item.getPrice().doubleValue())
-                            .build()
-            );
-        }
-        return protoBuilder.build().toByteArray();
-    }
 
 
 }

@@ -1,0 +1,437 @@
+================================================================================
+ traffic-e-commerce : 최소 기능 동작(MVP)을 위한 작업 목록
+ 작성일: 2026-10-10 (갱신 2026-10-11, [x] 완료 / [~] 일부 완료)
+ 기준 브랜치: feature/event-interaction (27b3997, upstream = f-lab-edu/traffic-e-commerce)
+ 참고 문서: doc/ecommerce-eda.pdf, src/designEDA.puml
+================================================================================
+
+[목표]
+  단일 프로세스(모듈러 모놀리스) 상태에서 src/designEDA.puml 의 오케스트레이션 사가 흐름이
+  Kafka 이벤트로 끝까지 동작하는 것.
+
+    주문 생성 -> 재고 확인/차감 -> 결제 -> 배송 요청 -> 배송 생성(SHIPPED) -> 배송 완료(DELIVERED)
+    보상: 재고 부족 -> 주문 취소 / 결제 실패 -> 재고 복구 + 주문 취소
+
+  (MSA 분리, Outbox, DLT 등은 MVP 이후 단계 - 맨 아래 "다음 단계" 참고)
+
+[우선순위 표기]
+  P0 : 빌드/기동 자체를 막거나, 메시지 유실·무한 루프를 일으키는 문제 (가장 먼저)
+  P1 : 사가 흐름이 이어지지 않는 로직 오류 / 미구현
+  P2 : 동작은 하나 잘못된 결과를 내거나 위험한 부분
+  P3 : 정리/개선 (MVP 필수 아님)
+
+[상태 표기]  [ ] 미완료   [x] 완료
+
+[main 대비 이 브랜치에서 이미 해결된 항목] - 참고용
+  [x] ShipmentService <-> ExternalCarrierService 순환 참조
+      (ApplicationEventPublisher + CarrierUpdateEvent / ShipmentStatusUpdateEvent + @EventListener)
+  [x] ShipmentRepository.findByOrderUUIDin -> findByOrderUUIDIn
+  [x] ShipmentEventPublisher KafkaTemplate<String, Object> -> <String, byte[]>
+  [x] 배송 이벤트 토픽 "shipment" -> "shipment-events", 키 shipment.* 로 통일
+  [x] 사가 흐름 방향 확정: 오케스트레이션 + "재고 먼저, 결제 나중" (designEDA.puml)
+  [x] 결제 트리거를 REST(PaymentController) 에서 이벤트 기반 자동 결제로 변경
+
+
+================================================================================
+ 0. 개발 환경 (P0)
+================================================================================
+
+[ ] 0-1. JDK 21 설치
+      - build.gradle toolchain 21, 로컬에는 JDK 17 만 있음 -> 컴파일 불가
+
+[ ] 0-2. docker-compose.yml 추가 (MySQL 8 + Kafka(KRaft) [+ kafka-ui 선택])
+      - 사용 토픽: order-events, product-events, payment-events, shipment-events
+        (4-1 에서 토픽 구조를 바꾸면 그에 맞춰 수정)
+
+[ ] 0-3. Dockerfile 수정
+      - "apt-get update %% \" -> "&&" 오타
+      - ubuntu:18.04 에는 openjdk-21 없음 -> eclipse-temurin:21-jre 등으로 교체
+
+[ ] 0-4. 비밀값 분리
+      - application.yaml 의 DB 비밀번호, jwt.secret 평문 -> 환경변수 또는 .gitignore 된 로컬 설정
+
+[ ] 0-5. Git 리모트 정리
+      - origin(jamiewell 포크) 에는 main 만 있고 feature 브랜치는 upstream(f-lab-edu) 에만 있음
+      - 앞으로 어느 저장소에 push/PR 할지 결정
+
+
+================================================================================
+ 1. 빌드 실패 - 컴파일 에러 (P0)
+================================================================================
+
+[x] 1-1. OrderSagaOrchestrator.requestPayment
+      - publishPaymentRequested(orderUUID, userId, totalPrice, address, contact) : 인자 5개
+      - OrderSagaEventPublisher.publishPaymentRequested(UUID, UUID, BigDecimal, String) : 파라미터 4개
+      - 실제로 필요한 값(orderUUID, totalPrice)만 받도록 시그니처 정리
+
+[x] 1-2. OrderSagaOrchestrator.requestShipment
+      - publishShipmentRequested(orderUUID, userId, address, contact, contact, items) : 인자 6개 (contact 중복)
+      - OrderSagaEventPublisher.publishShipmentRequested(...) : 파라미터 5개
+
+[x] 1-3. OrderServiceTest 가 삭제된 com.ecommerce.proto.EdaMessage 를 import
+      - OrderCreatedEvent (com.ecommerce.proto) 로 변경
+
+[x] 1-4. 위 수정 후 ./gradlew build 로 남은 컴파일 에러 확인
+      - com.ecommerce.order.status.* 와 com.ecommerce.proto.* 를 동시에 와일드카드 import 하는 곳에서
+        이름 충돌(OrderStatus, SagaStep 은 proto 에도 enum 으로 존재)이 없는지 확인
+
+
+================================================================================
+ 2. 메시지 유실 / 무한 루프 (P0) - 빌드가 되더라도 흐름 테스트 전에 반드시 수정
+================================================================================
+
+[~] 2-1. 컨슈머 그룹 충돌  ★ 가장 심각  -> Order 완료
+      - order/event/saga/OrderSagaEventConsumer 가 다른 도메인의 groupId 를 그대로 사용
+          product-events  : groupId "product-service"  -> ActiveStockEventConsumer 와 같은 그룹
+          shipment-events : groupId "shipment-service" -> ShipmentEventConsumer 와 같은 그룹
+          order-events    : groupId "order-service"    -> OrderEventConsumer 와 같은 그룹
+          payment-events  : groupId "payment-service"
+      - 같은 그룹 안에서는 메시지 1건이 컨슈머 1개에만 전달됨
+        -> 재고 요청이 오케스트레이터로, 재고 결과가 상품 컨슈머로 가는 식으로 엉뚱한 곳에서 소비됨
+      - 오케스트레이터 전용 그룹(예: "order-saga") 으로 분리
+
+[~] 2-2. switch fall-through (break 누락)  -> Order 완료
+      - OrderSagaEventConsumer : consumeOrderEvents / consumeProductEvents / consumePaymentEvents 의 switch
+          order.created   -> 사가 시작 후 취소 처리까지 실행
+          payment.success -> 성공/실패/취소 핸들러 모두 실행
+      - ActiveStockEventConsumer.consumeOrderEvents 의 switch
+          stock.check -> 확인 -> 차감 -> 복구 가 연달아 실행
+      - proto 필드 번호가 우연히 호환되어 파싱 에러 없이 조용히 오동작함
+      - 각 case 에 break 추가 또는 Java 21 화살표 switch(case "x" -> ...) 로 변경
+
+[x] 2-3. 주문 취소 무한 루프
+      - OrderSagaEventConsumer : order.cancelled 수신 -> orchestrator.cancelOrderSaga()
+        -> OrderSagaEventPublisher.publishOrderCancelled() 가 order.cancelled 를 다시 발행 -> 반복
+      - OrderEventConsumer : order.cancelled 수신 -> orderService.cancelOrder()
+        -> order.cancelled 를 다시 발행 -> 반복
+      - 해결안: "취소 요청(command)" 과 "취소됨(event)" 을 다른 키/토픽으로 분리하고,
+        자신이 발행한 이벤트를 자신이 다시 처리하지 않도록 구조 정리
+
+[x] 2-4. OrderEventConsumer 와 OrderSagaEventConsumer 역할 중복
+      - 둘 다 order-events / order.created, order.cancelled 를 구독
+      - OrderEventConsumer.createOrderEvent 는 내용이 주석 처리된 상태
+      - 하나로 통합 (오케스트레이터 쪽 유지 권장), 빈 클래스 OrderEventPublisher 정리
+
+[~] 2-5. 요청(command) 과 결과(event) 가 같은 토픽에 섞여 있음  -> Order 발행측 완료
+      - product-events : 오케스트레이터의 stock.check / stock.deduct 요청 + 상품의 stock.* 결과
+      - shipment-events : 오케스트레이터의 shipment.requested 요청 + 배송의 shipment.* 결과
+      - 2-1 을 고쳐도 각 컨슈머가 자신과 무관한 키를 계속 받게 됨
+      - 4-1 의 토픽 설계에서 함께 결정
+
+
+================================================================================
+ 3. 기동/런타임 공통 설정 (P0~P1)
+================================================================================
+
+[~] 3-1. Kafka 리스너 컨테이너 팩토리 정리  -> 공통 팩토리 1개로 정리, payment/shipment 리스너 ack 미구현
+      - config/KafkaConfig.java 의 ConsumerFactory 4개 + ListenerContainerFactory 4개를
+        어떤 @KafkaListener 도 containerFactory 로 지정하지 않음
+      - 기본 팩토리 생성 시 ConsumerFactory 빈이 여러 개라 모호성 문제로 기동 실패 가능
+      - ActiveStockEventConsumer 는 Acknowledgment 파라미터를 받는데 기본 팩토리는 MANUAL ack 가 아님
+        -> 메시지 수신 시 예외
+      - 팩토리를 하나로 통합(빈 이름 kafkaListenerContainerFactory), ack 정책을 정하고 모든 컨슈머에 동일 적용
+
+[ ] 3-2. ProductRepository ID 타입 오류
+      - JpaRepository<Product, String> -> Product.id 는 long 이므로 <Product, Long>
+
+[~] 3-3. 트랜잭션 어노테이션 통일  -> Order 완료
+      - OrderSagaOrchestrator, ShipmentService, ProductService 가 jakarta.transaction.Transactional 사용
+      - org.springframework.transaction.annotation.Transactional 로 통일
+
+[ ] 3-4. contextLoads 통과 확인 (ECommerceApplicationTests)
+
+
+================================================================================
+ 4. 사가 흐름 연결 (P1) - designEDA.puml 기준
+================================================================================
+
+[현재 구간별 상태]
+  | 단계              | 발행 (토픽 / 키)                                   | 수신 측 기대값                      | 상태 |
+  |-------------------|----------------------------------------------------|-------------------------------------|------|
+  | 1 주문 생성       | OrderService -> order-events / order.created       | 사가 컨슈머 order-events            | 2장 문제 |
+  | 2 재고 확인 요청  | 오케스트레이터 -> product-events / stock.check     | 상품 product-events / stock.check   | 일치 (2-2 문제) |
+  | 2' 재고 확인 응답 | 상품 -> stock.check.response                       | 오케스트레이터                      | 불가 |
+  | 3 재고 차감 결과  | 상품 -> stock.bulk.deducted / stock.lacked         | 오케스트레이터                      | 핸들러 비어 있음 |
+  | 4 결제 요청       | 오케스트레이터 -> payment-events / saga.payment.request | 결제 saga-events / order.created | 토픽·키 불일치 |
+  | 5 결제 결과       | 결제 -> payment-events / payment.success, failed   | 오케스트레이터                      | 일치 (4-C-1 문제) |
+  | 5' 결제 실패 보상 | (미호출) order-event / stock.restore               | 상품 product-events / stock.restore | 미호출 + 토픽 오타 |
+  | 6 배송 요청       | 오케스트레이터 -> shipment-events / shipment.requested | 배송 shipment-events / shipment.requested | 일치 (4-D-1 문제) |
+  | 7 배송 결과       | 배송 -> shipment-events / shipment.created, completed, failed | 오케스트레이터            | 핸들러 비어 있음 |
+
+[x] 4-1. 토픽 / 키 / 메시지 규칙 최종 확정 후 문서화 (designEDA.puml 옆에 표로)
+      - 권장안 A: 요청용 토픽과 결과용 토픽 분리
+          요청: saga-commands (또는 도메인별 product-commands, payment-commands, shipment-commands)
+          결과: product-events, payment-events, shipment-events
+      - 키: orderUUID 사용 권장 (같은 주문의 이벤트 순서 보장 = 같은 파티션)
+        이벤트 타입은 헤더(eventType) 로 구분 (현재는 키에 이벤트 타입을 넣어 주문 단위 순서가 보장되지 않음)
+      - 확정 후 모든 발행/구독 코드의 토픽 문자열을 상수 클래스 하나로 모으기
+        (현재 order-event / saga-events 같은 오타·불일치가 계속 발생)
+
+[~] 4-2. 상태값 정리 (규칙: doc/status-convention.md, 아래는 원래 메모)  -> Order 완료
+      - order/status/OrderStatus : INVENTORY_REQUESTED, PAYMENT_REQUESTED 추가됨.
+        주석 의미 재확인 (SHIPPED "배송 요청", DELIVERED "배송 진행중" 은 이름과 맞지 않음)
+      - OrderStatus 에 상태 전이 규칙(canTransitionTo) 추가, Order.updateStatus() 에서 검증
+      - proto 의 enum OrderStatus / SagaStep 과 Java enum 이 이름·값이 서로 다름 -> 한쪽 기준으로 통일하거나
+        proto enum 을 쓰지 않는다면 제거
+
+---------------------------------------- 4-A. Order (오케스트레이터)
+[x] 4-A-1. startOrderSaga 가 이벤트로 새로 만든 Order 객체를 사용
+      - OrderSagaEventConsumer.parseOrderCreated -> Order.of(OrderCreatedEvent) 는 DB 엔티티가 아님
+      - order.updateStatus(INVENTORY_REQUESTED) 가 DB 에 반영되지 않음
+      - orderUUID 로 orderRepository 에서 조회한 엔티티를 사용하도록 변경
+        (Order.of(OrderCreatedEvent) 는 저장하면 @PrePersist 가 UUID 를 덮어써 중복 주문이 생기므로 사용 금지)
+
+[x] 4-A-2. 재고 단계 흐름 정리 (결정: 확인 -> 차감 2단계 유지, 단순/배치 차감 모두 유지. 멘토 의견 반영)
+      - 현재: stock.check 요청만 발행, requestStockDeduction() 은 private 이고 호출하는 곳 없음
+      - stock.check.response 핸들러에서 차감 요청 발행: 상품 1개 -> stock.deduct / N개 -> stock.bulk.deduct
+      - 확인은 예약이 아님. 차감 시 비관적 락 안에서 재검사하므로 확인 후 재고가 바뀌어도 lacked 로 안전하게 실패
+      - 규칙: doc/kafka-convention.md 3장
+
+[x] 4-A-3. 재고 차감 결과 핸들러 구현
+      - handleStockBulkDeducted() 비어 있음 (상품이 실제로 발행하는 키는 stock.bulk.deducted)
+      - handleStockDeductSuccess() 는 단건 키 stock.deducted 에만 연결됨
+      - 성공 시: INVENTORY_CONFIRMED -> requestPayment()
+
+[x] 4-A-4. 재고 부족 처리 수정
+      - handleStockLacked() 가 compensatePayment()(결제 취소) 를 호출
+        -> "재고 먼저" 흐름에서는 이 시점에 결제가 없음. 주문 취소 + 사가 FAILED 로 종료해야 함
+      - compensatePayment() 는 빈 바이트(new byte[0]) 를 발행 중이며 받는 쪽도 없음
+
+[x] 4-A-5. 결제 실패 보상 구현
+      - handlePaymentFailed() 가 재고 복구 요청을 발행하지 않음 (designEDA.puml 에는 stock.restore 있음)
+      - publishStockRestoreRequested() 호출 추가, 토픽 "order-event"(오타) -> 4-1 에서 정한 토픽으로
+      - handleStockRestored() 비어 있음 -> 복구 완료 시 사가 COMPENSATED
+
+[x] 4-A-6. 배송 결과 핸들러 구현
+      - consumeShipmentEvents -> operateShipmentEvent() 비어 있음
+      - shipment.created -> SHIPPED / shipment.completed -> DELIVERED + 사가 COMPLETED
+      - shipment.failed -> 처리 정책 결정 (재시도 / 환불 + 재고 복구 / 수동 처리)
+
+[x] 4-A-7. 사용자 주문 취소 흐름 (2-3 과 함께)
+      - 사가 진행 단계에 따라 보상 분기: 재고만 차감됨 -> 재고 복구 / 결제 완료 -> 결제 취소 + 재고 복구 /
+        배송 시작 후 -> 취소 불가
+      - OrderService.cancelOrder 의 취소 가능 상태 검증
+
+[x] 4-A-8. OrderService.createOrder / cancelOrder 에 @Transactional 없음
+
+[~] 4-A-9. 사가 엔티티 활용  -> retryCount 미사용
+      - retryCount / canRetry / MAX_RETRY_COUNT 가 정의만 되어 있고 사용되지 않음 (MVP 에서는 제거하거나 보류 표시)
+      - 사가 상태 변경 메서드 일부가 currentStep 만 바꾸고 sagaStatus 는 그대로 (requestStockQtyChecked 등)
+
+---------------------------------------- 4-B. Product
+[ ] 4-B-1. 재고 차감/복구에 트랜잭션 없음  ★ 재고 단계가 진행되지 않는 원인
+      - ProductService.deductStock / deductStocks / restoreStock / restoreStocks
+      - PESSIMISTIC_WRITE 락을 트랜잭션 밖에서 실행 -> TransactionRequiredException
+        (예외가 안 나도 락 즉시 해제 + dirty checking 미동작 -> 차감 미반영)
+      - Spring @Transactional 추가
+
+[ ] 4-B-2. 벌크 차감 부분 실패 시 롤백 안 됨
+      - deductStocks : 일부만 성공해도 성공분 차감이 남음 -> 하나라도 실패하면 예외로 전체 롤백
+      - productMap.get() 이 null(없는 상품)일 때 NPE 처리
+
+[ ] 4-B-3. hasStockActive() 로직 오류 (확인 단계 유지 결정 -> 필수)
+      - productList.size() (상품 개수) 를 요청 수량과 비교 -> 재고 수량(stockQuantity) 과 비교해야 함
+      - 하나라도 부족하면 false 여야 하는데, 조건이 반대로 되어 있음
+      - publishStockActive() 가 orderUUID 와 결과 값을 담지 않은 빈 메시지를 발행
+
+[ ] 4-B-4. 이벤트 데이터 오류
+      - publishBulkStockDeduct : deductQuantity 에 remainingStock 을 넣음
+      - publishBulkStockFailed : requestedQuantity 를 0 으로 고정
+      - StockDeductResult 에 요청 수량을 담아 올바르게 채우기
+
+[ ] 4-B-5. 메시지 타입 불일치 (현재는 필드 번호가 같아서 우연히 동작)
+      - 오케스트레이터는 SagaStockDeductEvent / SagaStockRestoreEvent 로 발행,
+        상품은 StockDeductEvent / StockRestoredEvent 로 파싱
+      - 요청 메시지와 결과 메시지를 명확히 구분해 같은 타입으로 발행/파싱
+
+---------------------------------------- 4-C. Payment
+[ ] 4-C-1. 결제 대기 생성 실패
+      - Payment.paymentMethod 가 nullable = false 인데 createPendingPayment 는 값을 넣지 않음 -> INSERT 실패
+      - nullable = true 로 변경하거나 기본값 지정
+
+[ ] 4-C-2. 결제 요청 수신 토픽/키 불일치
+      - 결제 컨슈머: topics = "saga-events", 키 order.created / order.cancelled
+      - 오케스트레이터 발행: "payment-events" / "saga.payment.request"
+      - 4-1 에서 정한 토픽/키로 맞추기. 결제 취소 요청 키도 함께 정의
+
+[ ] 4-C-3. 메시지 타입 불일치 (우연히 호환)
+      - 오케스트레이터는 SagaPaymentRequestEvent, 결제는 PaymentRequestedEvent 로 파싱
+
+[ ] 4-C-4. 중복 결제 방지 방식
+      - createPendingPayment 가 중복이면 EntityNotFoundException("duplicated ...") 을 던짐 -> 예외 타입이 의미와 다름
+      - 같은 orderUUID 의 결제가 이미 COMPLETED 인 경우도 확인 (현재는 PENDING 만 확인)
+      - findByOrderUUIDAndStatus 가 단건 반환으로 바뀌어 2건 이상이면 예외
+
+[ ] 4-C-5. 트랜잭션 안에서 PG 호출
+      - createPendingPayment(@Transactional) -> processPaymentWithDetails 가 같은 트랜잭션에서
+        가짜 PG 를 0.5~1.5초 sleep 하며 호출 -> 커넥션 점유. MVP 에서는 허용하되 주석으로 남기기
+
+[ ] 4-C-6. 결제 조회 API 가 PaymentController 삭제와 함께 사라짐 -> 확인용 GET 최소 API 재추가 검토
+
+---------------------------------------- 4-D. Shipment
+[ ] 4-D-1. 배송 생성 전에 조회부터 함
+      - ShipmentEventConsumer.operateShipRequested :
+        getShipmentByOrderUUID() (없으면 예외) -> createShipExecution()
+        -> 배송이 아직 없으므로 항상 예외, 배송이 생성되지 않음
+      - SagaShipmentRequestEvent 를 파싱해 바로 배송 생성 (현재는 OrderLifecycleEvent 로 파싱 중)
+
+[ ] 4-D-2. createShipExecution 이 잘못된 객체로 이벤트 발행
+      - 저장한 preparedShip 이 아니라 파라미터 shipment 로 publishShipCreated / requestDelivery 호출 -> shipUUID null
+      - 중복 배송 체크가 warn 로그만 남기고 계속 진행 -> return 처리
+
+[ ] 4-D-3. cancelShipment 가 조회한 엔티티가 아닌 파라미터 객체의 상태를 변경
+      - optionalShip.updateShippingStatus(CANCELLED) 로 수정
+      - 배송 취소 요청 키 "shipment.cancelled" 를 발행하는 곳이 없음 (4-A-7 에서 정의)
+
+[ ] 4-D-4. 상태별 이벤트 매핑 오류
+      - ExternalShippingStatus.CANCELLED 가 publishShipCompleted 를 호출 -> 취소가 "완료"로 전달됨
+
+[ ] 4-D-5. 비동기 처리 정리
+      - @Async 사용하지만 @EnableAsync 없음 (내부 CompletableFuture 가 대신 비동기 처리 중)
+      - requestDelivery 에서 simulateDeliveryProcess 를 CarrierUpdateEvent 발행보다 먼저 시작
+        -> READY_FOR_PICKUP 반영 전에 SHIPPING 전이가 올 수 있음 (현재는 sleep 5초 이상이라 실제로는 드묾)
+      - @EventListener 는 발행한 비동기 스레드에서 동기 실행됨을 인지하고, 트랜잭션 경계 확인
+
+[ ] 4-D-6. ShipmentRequestedEvent(shipment_message.proto) 와 SagaShipmentRequestEvent(OrderEvent.proto) 중복
+      - 하나로 통일
+
+
+================================================================================
+ 5. Kafka 컨슈머 공통 (P1~P2)
+================================================================================
+
+[ ] 5-1. 예외를 catch 후 로그만 남기고 삼킴 (모든 컨슈머)
+      - 실패해도 오프셋이 커밋되어 메시지 유실
+      - MVP: DefaultErrorHandler + FixedBackOff 로 재시도 후 로그
+      - 이후: DeadLetterPublishingRecoverer 로 DLT 전송
+
+[ ] 5-2. ack 정책 통일 (3-1 과 함께)
+      - ActiveStockEventConsumer 만 수동 ack, 내부에서 예외를 삼키므로 실패해도 ack 됨
+
+[ ] 5-3. 프로듀서 전송 결과 확인
+      - kafkaTemplate.send(...) 의 결과(CompletableFuture) 를 확인하지 않음 -> 최소한 whenComplete 로 실패 로그
+
+[ ] 5-4. switch 의 key 가 null 이면 NPE (record.key() null 방어)
+
+
+================================================================================
+ 6. 데이터 정합성 (P2) - MVP 이후 바로 다룰 주제
+================================================================================
+
+[ ] 6-1. 이중 쓰기(Dual Write)
+      - DB 저장과 Kafka 발행이 원자적이지 않음 (오케스트레이터 포함 모든 도메인)
+      - MVP: @TransactionalEventListener(phase = AFTER_COMMIT) 에서 Kafka 발행
+      - 이후: Transactional Outbox 패턴
+
+[ ] 6-2. 컨슈머 멱등성
+      - 같은 이벤트를 두 번 받아도 결과가 같도록 (사가 currentStep 검사, processed_events 테이블 등)
+      - 모든 이벤트 proto 에 event_id, occurred_at 필드 추가 권장
+
+[ ] 6-3. 이벤트 순서
+      - 주문 취소가 먼저 도착하는 경우 (PDF p.6) - 키를 orderUUID 로 바꾸면(4-1) 같은 파티션 내 순서 보장
+
+[~] 6-4. Protobuf 정리  -> order proto 미사용 enum/메시지 삭제
+      - 요청/결과 메시지 중복·혼용 정리 (4-B-5, 4-C-3, 4-D-6)
+      - 필드 네이밍 혼재 (orderUUID / order_uuid, totalPrice / amount) -> snake_case 통일
+      - 금액 double -> string 또는 int64(원 단위)
+      - proto 디렉터리 대소문자 혼재 (Payment / order / product / shipment)
+      - 빈 파일 carrier_message.proto, 미사용 order_lifecycle_message.proto 정리
+      - 파일 상단 주석이 실제 파일명과 다름 (OrderEvent.proto 에 //shipment.proto 등)
+
+
+================================================================================
+ 7. 도메인 기능 오류 - 사가와 무관 (P2)
+================================================================================
+
+---------------------------------------- 7-A. Product
+[ ] 7-A-1. modifyProduct
+      - p.getSellerId().equals(sellerId) : UUID vs String 비교 -> 항상 false
+      - Product.of(product, imageList) 가 id 없는 새 엔티티 생성 -> save 시 새 row INSERT
+      - newImages / imageList 중복 생성, 카테고리를 매번 새로 INSERT 하고 상품에 반영 안 함
+      - Controller 의 modifyProduct / deleteProduct 파라미터에 @RequestBody 누락
+[ ] 7-A-2. registerProduct
+      - id/UUID 없는 새 객체 반환, 엔티티를 그대로 JSON 응답
+        -> Product.imageList <-> ProductImage.product 양방향 참조로 직렬화 무한 재귀 -> ProductResponse 로 반환
+
+---------------------------------------- 7-B. Member / 인증
+[ ] 7-B-1. 회원정보 수정 API
+      - MemberController.modifyUser : jwtService.generateToken(token) 호출 -> extractUserId 로 변경
+      - 토큰 subject 는 userId 인데 UserService.modifyUser 는 email 로 조회 -> userId 기준으로
+[ ] 7-B-2. 회원가입 응답에 Users 엔티티 반환 -> password, salt 노출 -> 응답 DTO
+[ ] 7-B-3. 회원정보 조회 API 없음 (PDF 요구사항)
+
+
+================================================================================
+ 8. 테스트 (P1~P2)
+================================================================================
+
+[ ] 8-1. contextLoads 통과 (3-4)
+[ ] 8-2. 재고 동시성 테스트
+      - ExecutorService + CountDownLatch 로 재고 N 개 상품에 M(>N) 개 동시 차감 -> 최종 재고 0, 성공 N 건
+[ ] 8-3. 사가 정상 흐름 통합 테스트
+      - @EmbeddedKafka 또는 Testcontainers(Kafka, MySQL) + Awaitility
+      - 주문 생성 -> 주문 DELIVERED, 사가 COMPLETED 까지 검증
+        (배송 시뮬레이션 sleep 이 최대 30초 이상이므로 테스트용으로 지연 시간을 설정값으로 분리)
+[ ] 8-4. 보상 흐름 테스트
+      - 재고 부족 -> 주문 CANCELLED, 결제 미생성
+      - 결제 실패 -> 재고 원복, 주문 CANCELLED, 사가 COMPENSATED
+[ ] 8-5. 회귀 테스트: 같은 이벤트 중복 수신, 주문 취소 시 루프가 생기지 않는지
+
+
+================================================================================
+ 9. 설계 문서 대비 미구현 기능 (P3) - MVP 이후
+================================================================================
+  (doc/ecommerce-eda.pdf 기준)
+[ ] 9-1. 사용자 관점 주문 추적 조회 (주문 처리중 / 생성 중 / 취소 중) - p.5 피드백에서 "신규 기능"으로 명시
+         -> OrderSaga 의 currentStep / sagaStatus 를 사용자용 상태로 매핑해 조회 API 제공
+[ ] 9-2. 로그인 공통 처리 필터/인터셉터 (컨트롤러마다 auth.replace("Bearer ", "") 중복) - p.4, p.5
+[ ] 9-3. 구매자 배송 상태 조회 API (진행 상태, 택배사, 예상 도착일) - ShipmentController 없음
+[ ] 9-4. 판매자: 자기 상품의 주문 내역 조회 / 배송 요청 목록 / 배송 시작 등록 - p.12, p.13
+[ ] 9-5. 배송지 등록, 장바구니 - p.1
+[ ] 9-6. 주문 목록·판매자 상품 목록 페이징 - p.4, p.5
+[ ] 9-7. 결제 원장/영수증: 결제 상태를 덮어쓰지 않고 모든 결제 이벤트를 기록 - p.5~6
+[ ] 9-8. 부분 취소, 반품(배송 완료 후) - p.15~16
+[ ] 9-9. cascade 지양 (Order -> OrderItem CascadeType.ALL) - p.5
+
+
+================================================================================
+ 10. 코드 정리 (P3)
+================================================================================
+[ ] 10-1. 오타/네이밍: payment/paymenrService, member/dto/requset, orderController/productController 소문자 클래스명,
+          패키지명 혼재 (memberEntity / paymentDomain / domain / orderEntity)
+[ ] 10-2. 미사용 코드 제거: payment/event/model/*Event.java (POJO), shipment/event/model/OrderEvent.java,
+          OrderEventPublisher(빈 클래스), OrderSagaOrchestrator 의 미사용 import(Shipment, ExternalShippingStatus 등),
+          publishShipmentRequested 안의 미사용 SagaStockDeductEvent.Builder
+[ ] 10-3. 로그 메시지 언어 통일 (한글/영문 혼재)
+[ ] 10-4. 엔티티 캡슐화: Users public 필드, Product/ProductImage @Setter
+[ ] 10-5. 도메인 간 직접 의존 제거 (MSA 분리 대비)
+          - ProductService -> member.UserRepository
+          - shipment -> payment enum import
+          - order.status 에 PaymentStatus / ProductStatus / ShipmentStatus 를 따로 둔 것은 좋음 (사가가 타 도메인 enum 에 의존하지 않음)
+[ ] 10-6. @RestControllerAdvice 공통 예외 처리
+[ ] 10-7. 로그에 orderUUID 를 MDC 로 넣어 사가 흐름 추적
+
+
+================================================================================
+ 권장 작업 순서
+================================================================================
+  1) 0장 환경 -> 1장 컴파일 에러 -> 3장 공통 설정 -> contextLoads 통과
+  2) 2장 (그룹 충돌, break, 취소 루프) - 흐름 테스트 전에 반드시
+  3) 4-1 토픽/키 규칙 확정 (문서 먼저)
+  4) 정상 흐름을 한 구간씩 연결하며 수동 테스트
+       4-B-1 (재고 트랜잭션) -> 4-A-1~3 (재고 단계) -> 4-C-1~2 (결제) -> 4-D-1~2 (배송) -> 4-A-6 (배송 결과)
+  5) 보상 흐름: 4-A-4, 4-A-5, 4-A-7
+  6) 5장 컨슈머 에러 처리 최소 적용
+  7) 8장 통합 테스트로 전체 흐름 고정
+  8) 6장 정합성 -> 다음 단계
+
+
+================================================================================
+ 다음 단계 (MVP 이후, 참고)
+================================================================================
+  - Transactional Outbox + CDC(Debezium) 또는 폴링 퍼블리셔
+  - DLT, 재시도 토픽, 멱등 컨슈머, 사가 타임아웃(스케줄러로 멈춘 사가 탐지 - OrderSagaRepository 에 조회 메서드 이미 있음)
+  - Redis 분산락 검토 (PDF p.6~7)
+  - Gradle 멀티모듈: common-proto + 도메인별 애플리케이션
+  - 도메인별 DB 분리 후 프로세스 분리 기동
+  - API Gateway, 분산 추적(Micrometer Tracing + Zipkin/Tempo), Schema Registry

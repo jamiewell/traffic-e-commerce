@@ -65,29 +65,25 @@ public class OrderSaga {
         if (startedAt == null) startedAt = LocalDateTime.now();
     }
 
-    // 사가 상태 전환 메서드 : 재고 확인 요청 시작
     public void requestStockQtyChecked() {
         this.currentStep = SagaStep.STOCK;
-    }
-
-    public void execStockDeduction() {
-        this.currentStep = SagaStep.STOCK;
+        this.sagaStatus = SagaStatus.IN_PROGRESS;
     }
 
     public void completeStockDeduction() {
         this.productStatus = ProductStatus.DEDUCTED;
     }
 
-    // 사가 상태 전환 메서드 : 재고 부족, 결제 환불
-    public void failStockDeduction() {
+    // 재고 부족 : 보상할 것이 없으므로 바로 실패 종료
+    public void failStockDeduction(String reason) {
         this.productStatus = ProductStatus.INSUFFICIENT;
-        this.currentStep = SagaStep.COMPENSATING;
+        this.sagaStatus = SagaStatus.FAILED;
+        this.failureReason = reason;
+        this.failedAt = LocalDateTime.now();
     }
 
-    // 사가 상태 전환 메서드: 결제 요청 시작
     public void startPayment() {
         this.currentStep = SagaStep.PAYMENT;
-        this.sagaStatus = SagaStatus.IN_PROGRESS;
     }
 
     public void completePayment() {
@@ -96,11 +92,8 @@ public class OrderSaga {
 
     public void failPayment() {
         this.paymentStatus = PaymentStatus.FAILED;
-        this.sagaStatus = SagaStatus.FAILED;
-        this.failedAt = LocalDateTime.now();
     }
 
-    // 사가 상태 전환 메서드 : 배송 요청 시작
     public void startShipment() {
         this.currentStep = SagaStep.SHIPMENT;
     }
@@ -111,23 +104,48 @@ public class OrderSaga {
         this.completedAt = LocalDateTime.now();
     }
 
-    // 사가 상태 전환 메서드 : 결제 환불
-    public void execCompensation() {
-        this.currentStep = SagaStep.COMPENSATING;
+    public void failShipment() {
+        this.shipmentStatus = ShipmentStatus.FAILED;
+    }
+
+    public void execCompensation(String reason) {
         this.sagaStatus = SagaStatus.COMPENSATING;
+        if (this.failureReason == null) {
+            this.failureReason = reason;
+            this.failedAt = LocalDateTime.now();
+        }
     }
 
-    public void completeCompensation() {
-        this.sagaStatus = SagaStatus.COMPENSATED;
-        this.completedAt = LocalDateTime.now();
+    public void completeStockRestoration() {
+        this.productStatus = ProductStatus.RESTORED;
     }
 
-    public void incrementRetryCount() {
-        this.retryCount++;
+    public void completePaymentCancellation() {
+        this.paymentStatus = PaymentStatus.CANCELLED;
     }
 
-    public boolean canRetry() {
-        return this.retryCount < 3; // 최대 3회 재시도
+    public boolean needsStockRestoration() {
+        return this.productStatus == ProductStatus.DEDUCTED;
+    }
+
+    public boolean needsPaymentCancellation() {
+        return this.paymentStatus == PaymentStatus.COMPLETED;
+    }
+
+    public void completeCompensationIfDone() {
+        if (this.sagaStatus == SagaStatus.COMPENSATING && !needsStockRestoration() && !needsPaymentCancellation()) {
+            this.sagaStatus = SagaStatus.COMPENSATED;
+            this.completedAt = LocalDateTime.now();
+        }
+    }
+
+    public boolean isInProgressAt(SagaStep step) {
+        return this.sagaStatus == SagaStatus.IN_PROGRESS && this.currentStep == step;
+    }
+
+    // 취소/보상 진행 중이거나 보상 완료
+    public boolean isCompensated() {
+        return this.sagaStatus == SagaStatus.COMPENSATING || this.sagaStatus == SagaStatus.COMPENSATED;
     }
 
 }

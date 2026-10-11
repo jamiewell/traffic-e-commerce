@@ -1,0 +1,14 @@
+@startuml
+!theme plain
+!pragma layout smetana
+title 3. Payment 결제 상태 (PaymentStatus)
+hide empty description
+
+[*] --> PENDING : payment.request 수신
+PENDING --> COMPLETED : PG 성공\n/ payment.succeeded 발행
+PENDING -[#red]-> FAILED : PG 실패\n/ payment.failed 발행
+COMPLETED -[#orange]-> CANCELLED : payment.cancel 수신\n/ payment.cancelled 발행
+FAILED --> [*]
+CANCELLED --> [*]
+COMPLETED --> [*]
+@enduml

@@ -7,7 +7,8 @@ import com.ecommerce.order.orderEntity.Order;
 import com.ecommerce.order.orderRepository.OrderItemRepository;
 import com.ecommerce.order.orderRepository.OrderRepository;
 import com.ecommerce.order.status.OrderStatus;
-import com.ecommerce.proto.EdaMessage;
+import com.ecommerce.config.EventTypes;
+import com.ecommerce.proto.OrderCreatedEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -107,16 +108,16 @@ class OrderServiceTest {
         then(savedOrder.get().getContact()).isEqualTo("010-8483-4895");
 
         AtomicBoolean messageReceived = new AtomicBoolean(false);
-        AtomicReference<EdaMessage.OrderCreatedEvent> receivedEvent = new AtomicReference<>();
+        AtomicReference<OrderCreatedEvent> receivedEvent = new AtomicReference<>();
 
         await().atMost(10, TimeUnit.SECONDS)
                 .pollInterval(Duration.ofMillis(500))
                 .until(() -> {
                     consumer.poll(Duration.ofMillis(500))
                             .forEach(data -> {
-                                if ("order.created".equals(data.key())) {
+                                if (EventTypes.ORDER_CREATED.equals(EventTypes.resolveEventType(data))) {
                                     try {
-                                        EdaMessage.OrderCreatedEvent event = EdaMessage.OrderCreatedEvent.parseFrom(data.value());
+                                        OrderCreatedEvent event = OrderCreatedEvent.parseFrom(data.value());
                                         if (response.getOrderUUID().toString().equals(event.getOrderUUID())) {
                                             receivedEvent.set(event);
                                             messageReceived.set(true);
@@ -131,13 +132,13 @@ class OrderServiceTest {
                     return messageReceived.get();
                 });
 
-        EdaMessage.OrderCreatedEvent event = receivedEvent.get();
+        OrderCreatedEvent event = receivedEvent.get();
         then(event).isNotNull();
         then(event.getUserId()).isEqualTo(userId.toString());
         then(event.getAddress()).isEqualTo(createRequest.getAddress());
         then(event.getContact()).isEqualTo(createRequest.getContact());
-        then(event.getTotalPrice()).isEqualTo(response.getTotalPrice());
-        then(event.getItemsCount()).isEqualTo(9);
+        then(event.getTotalPrice()).isEqualTo(response.getTotalPrice().doubleValue());
+        then(event.getItemsCount()).isEqualTo(2);
     }
 
     @Test
@@ -240,7 +241,8 @@ class OrderServiceTest {
         OrderResponse cancelledOrder = orderService.cancelOrder(createdOrder.getOrderUUID());
 
         then(cancelledOrder).isNotNull();
-        then(cancelledOrder.getItems().size()).isEqualTo(4);
+        then(cancelledOrder.getStatus()).isEqualTo(OrderStatus.CANCELLED);
+        then(cancelledOrder.getItems().size()).isEqualTo(5);
 
     }
 

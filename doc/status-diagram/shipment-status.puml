@@ -1,0 +1,23 @@
+@startuml
+!theme plain
+!pragma layout smetana
+title 4. Shipment 배송 상태 (ExternalShippingStatus)
+hide empty description
+
+[*] --> READY : shipment.request 수신\n/ shipment.created 발행
+READY --> READY_FOR_PICKUP : / shipment.changed
+READY_FOR_PICKUP --> SHIPPING : / shipment.changed
+SHIPPING --> DELIVERED : / shipment.completed
+SHIPPING -[#red]-> FAILED : / shipment.failed
+READY -[#orange]-> CANCELLED : / shipment.cancelled (신규)
+READY_FOR_PICKUP -[#orange]-> CANCELLED
+
+DELIVERED --> [*]
+FAILED --> [*]
+CANCELLED --> [*]
+
+note right of CANCELLED
+  현재 코드는 CANCELLED 에서
+  publishShipCompleted() 호출 → 수정 필요
+end note
+@enduml

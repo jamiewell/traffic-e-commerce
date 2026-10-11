@@ -1,0 +1,28 @@
+@startuml
+!theme plain
+!pragma layout smetana
+title 1. Order 주문 상태 (OrderStatus)
+hide empty description
+
+[*] --> ORDERED : POST /orders
+ORDERED --> INVENTORY_REQUESTED : stock.check 발행
+INVENTORY_REQUESTED --> INVENTORY_CONFIRMED : stock.deducted\nstock.bulk.deducted
+INVENTORY_CONFIRMED --> PAYMENT_REQUESTED : payment.request 발행
+PAYMENT_REQUESTED --> PAID : payment.succeeded
+PAID --> SHIPPED : shipment.created
+SHIPPED --> DELIVERED : shipment.completed
+DELIVERED --> [*]
+
+INVENTORY_REQUESTED -[#red]-> CANCELLED : 재고 부족\n(check.response / lacked / bulk.lacked)
+PAYMENT_REQUESTED -[#red]-> CANCELLED : payment.failed
+PAID -[#red]-> CANCELLED : shipment.failed
+ORDERED -[#gray,dashed]-> CANCELLED
+INVENTORY_CONFIRMED -[#gray,dashed]-> CANCELLED
+CANCELLED --> [*]
+
+note right of CANCELLED
+  최종 상태
+  사유는 OrderSaga.failureReason 에 기록
+  회색 점선 = 사용자 취소 (PAYMENT_REQUESTED 까지)
+end note
+@enduml
