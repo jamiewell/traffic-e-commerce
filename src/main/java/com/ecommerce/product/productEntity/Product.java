@@ -97,6 +97,13 @@ public class Product {
     }
 
     /**
+     * 판매중 상품의 재고 충분성 확인
+     */
+    public boolean canDeductStock(int requestedQty) {
+        return this.isActive && !this.isDeleted && hasEnoughStock(requestedQty);
+    }
+
+    /**
      * 재고 차감
      */
     public boolean deductStock(int quantity) {

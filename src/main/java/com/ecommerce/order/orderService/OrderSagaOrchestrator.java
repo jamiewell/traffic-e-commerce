@@ -115,6 +115,11 @@ public class OrderSagaOrchestrator {
             requestStockRestoration(order);
             return;
         }
+        // 재고 부족으로 실패한 뒤 도착한 차감 결과 -> 복구 (Product 가 이력 기준으로 중복 복구 방지)
+        if (saga.getSagaStatus() == SagaStatus.FAILED) {
+            requestStockRestoration(order);
+            return;
+        }
         if (!saga.isInProgressAt(SagaStep.STOCK) || saga.getProductStatus() != ProductStatus.PENDING) {
             log.info("[Orchestrator] ignore stock deducted : orderUUID={}", orderUUID);
             return;

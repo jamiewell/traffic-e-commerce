@@ -151,6 +151,18 @@ class OrderSagaOrchestratorTest {
     }
 
     @Test
+    @DisplayName("재고 부족 실패 후 차감 성공 도착 -> 재고 복구만 요청")
+    void stockDeducted_afterFailed() {
+        givenSaga(SagaStatus.FAILED, SagaStep.STOCK);
+        moveOrderTo(OrderStatus.INVENTORY_REQUESTED, OrderStatus.CANCELLED);
+
+        orchestrator.handleStockDeductSuccess(StockDeductEvent.newBuilder().setOrderUuid(orderUUID.toString()).build());
+
+        verify(sagaEventPublisher).publishStockRestoreRequested(eq(orderUUID), anyList());
+        verify(sagaEventPublisher, never()).publishPaymentRequested(any(), any());
+    }
+
+    @Test
     @DisplayName("결제 성공 -> 배송 요청")
     void paymentSuccess() {
         OrderSaga saga = givenSaga(SagaStatus.IN_PROGRESS, SagaStep.PAYMENT);

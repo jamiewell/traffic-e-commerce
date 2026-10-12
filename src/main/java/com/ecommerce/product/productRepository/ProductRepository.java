@@ -14,7 +14,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-public interface ProductRepository extends JpaRepository<Product, String> {
+public interface ProductRepository extends JpaRepository<Product, Long> {
 
     // 판매자/구매자 : 단일 상품 조회
     Optional<Product> findByProductUUID(UUID uuid);
@@ -52,8 +52,5 @@ public interface ProductRepository extends JpaRepository<Product, String> {
     @Query("select p from Product p " +
             "where p.productUUID in :productUUIDs order by p.productUUID")
     List<Product> findByProductUUIDsWithLock(@Param("productUUIDs") List<UUID> productUUIDs);
-
-    // 재고 조회
-    List<Product> findAllByProductUUID(UUID productUUID);
 
 }

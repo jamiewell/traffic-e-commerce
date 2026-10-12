@@ -7,21 +7,25 @@ import com.ecommerce.product.dto.request.ProductRegisterRequest;
 import com.ecommerce.product.dto.request.StockDeductRequest;
 import com.ecommerce.product.dto.response.ProductResponse;
 import com.ecommerce.product.dto.response.StockDeductResult;
+import com.ecommerce.product.dto.response.StockRestoreResult;
 import com.ecommerce.product.dto.search.DetailedSearchCondition;
 import com.ecommerce.product.event.ActiveStockEventPublisher;
 import com.ecommerce.product.productEntity.Product;
 import com.ecommerce.product.productEntity.ProductCategory;
 import com.ecommerce.product.productEntity.ProductImage;
+import com.ecommerce.product.productEntity.StockDeductHistory;
 import com.ecommerce.product.productRepository.ProductCategoryRepository;
 import com.ecommerce.product.productRepository.ProductImageRepository;
 import com.ecommerce.product.productRepository.ProductRepository;
-import jakarta.transaction.Transactional;
+import com.ecommerce.product.productRepository.StockDeductHistoryRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -37,6 +41,7 @@ public class ProductService {
     private final ProductRepository productRepository;
     private final ProductCategoryRepository categoryRepository;
     private final ProductImageRepository imageRepository;
+    private final StockDeductHistoryRepository historyRepository;
     private final ActiveStockEventPublisher eventPublisher;
 
     // 판매자: 전체 상품 조회
@@ -51,22 +56,6 @@ public class ProductService {
         List<Product> sellerProducts = productRepository.findBySellerIdAndIsActive(sellerId, isActive);
 
         return sellerProducts.stream().map(ProductResponse::from).collect(Collectors.toList());
-    }
-
-    public void hasStockActive(List<StockDeductRequest> requests) {
-
-        boolean hasStockActive = false;
-
-        for(StockDeductRequest request : requests) {
-            List<Product> productList = productRepository.findAllByProductUUID(request.getProductUUID());
-
-            if(productList.size() <= request.getQuantity()) {
-                hasStockActive = true;
-            }
-        }
-
-
-        eventPublisher.publishStockActive(hasStockActive);
     }
 
     // 판매자: 상품 최초 등록
@@ -167,95 +156,126 @@ public class ProductService {
     }
 
 
+    // 재고 확인 : 예약하지 않음, 실제 보장은 차감 시 락 안에서 재검사
+    @Transactional(readOnly = true)
+    public void hasStockActive(List<StockDeductRequest> requests, UUID orderUUID) {
+        List<StockDeductResult> results = mergeByProduct(requests).stream()
+                .map(request -> checkStock(productRepository.findByProductUUID(request.getProductUUID()).orElse(null), request))
+                .toList();
+
+        eventPublisher.publishStockActive(orderUUID, results);
+    }
+
     // 단일 상품 재고 차감
-    public StockDeductResult deductStock(UUID productUUID, int quantity, UUID orderUUID) {
+    @Transactional
+    public void deductStock(UUID productUUID, int quantity, UUID orderUUID) {
         log.info("Request deduce qty: productUUID={}, qty={}, orderUUID={}", productUUID, quantity, orderUUID);
-
-        try {
-            // 비관적 락으로 상품 조회
-            Product product = productRepository.findByProductUUIDWithLock(productUUID)
-                    .orElseThrow(() -> new IllegalArgumentException("cannot find product: " + productUUID));
-
-            // 재고 차감 시도
-            boolean success = product.deductStock(quantity);
-
-            if (success) {
-                // 성공 시 이벤트 발행
-                eventPublisher.publishStockDeduct(orderUUID, productUUID, quantity, product.getStockQuantity());
-                log.info("Success deduct stock: productUUID={}, remainingQty={}", productUUID, product.getStockQuantity());
-
-                return StockDeductResult.success(productUUID, product.getStockQuantity());
-            } else {
-                // 실패 시 이벤트 발행
-                eventPublisher.publishStockLacked(orderUUID, productUUID, quantity, product.getStockQuantity());
-                log.warn("Stock lacked: productUUID={}, requested qty={}, current qty={}", productUUID, quantity, product.getStockQuantity());
-
-                return StockDeductResult.failed(productUUID);
-            }
-
-        } catch (Exception e) {
-            log.error("Fail to deduct stock : productUUID={}, error={}", productUUID, e.getMessage());
-            return StockDeductResult.failed(productUUID);
+        if (isDeductedOrder(orderUUID)) {
+            return;
         }
+
+        // 비관적 락으로 상품 조회
+        Product product = productRepository.findByProductUUIDWithLock(productUUID).orElse(null);
+        StockDeductResult checked = checkStock(product, new StockDeductRequest(productUUID, quantity));
+
+        if (checked.hasFailed()) {
+            eventPublisher.publishStockLacked(orderUUID, productUUID, quantity, checked.getRemainingStock());
+            log.warn("Stock lacked: productUUID={}, requested qty={}, current qty={}", productUUID, quantity, checked.getRemainingStock());
+            return;
+        }
+
+        StockDeductResult result = deductAndRecord(product, quantity, orderUUID);
+        eventPublisher.publishStockDeduct(orderUUID, productUUID, quantity, result.getRemainingStock());
+        log.info("Success deduct stock: productUUID={}, remainingQty={}", productUUID, result.getRemainingStock());
     }
 
-    // 여러 상품 재고 차감(벌크+Dirty check)
+    // 여러 상품 재고 차감 : 전부 확인 후 차감 (하나라도 부족하면 차감 없음)
+    @Transactional
     public void deductStocks(List<StockDeductRequest> requests, UUID orderUUID) {
-        List<StockDeductResult> results = new ArrayList<>();
+        if (isDeductedOrder(orderUUID)) {
+            return;
+        }
 
-        List<UUID> productUUIDs = requests.stream().map(StockDeductRequest::getProductUUID)
-                .sorted()
-                .collect(Collectors.toList());
+        List<StockDeductRequest> mergedRequests = mergeByProduct(requests);
+        Map<UUID, Product> productMap = findProductMapWithLock(mergedRequests.stream().map(StockDeductRequest::getProductUUID).toList());
 
-        List<Product> products = productRepository.findByProductUUIDsWithLock(productUUIDs);
-        Map<UUID, Product> productMap = products.stream()
-                .collect(Collectors.toMap(Product::getProductUUID, Function.identity()));
+        List<StockDeductResult> checkedList = mergedRequests.stream()
+                .map(request -> checkStock(productMap.get(request.getProductUUID()), request))
+                .toList();
 
-        for (StockDeductRequest request : requests) {
-            Product product = productMap.get(request.getProductUUID());
+        if (checkedList.stream().anyMatch(StockDeductResult::hasFailed)) {
+            eventPublisher.publishBulkStockFailed(orderUUID, checkedList);
+            return;
+        }
 
-            boolean deductSucceed = product.deductStock(request.getQuantity());
+        List<StockDeductResult> results = mergedRequests.stream()
+                .map(request -> deductAndRecord(productMap.get(request.getProductUUID()), request.getQuantity(), orderUUID))
+                .toList();
+        eventPublisher.publishBulkStockDeduct(orderUUID, results);
+    }
 
+    // 재고 복구 : 차감 이력 기준, 이미 복구된 이력은 제외
+    @Transactional
+    public void restoreStocks(UUID orderUUID) {
+        List<StockDeductHistory> historyList = historyRepository.findByOrderUUIDAndIsRestoredFalse(orderUUID);
+        Map<UUID, Product> productMap = findProductMapWithLock(historyList.stream().map(StockDeductHistory::getProductUUID).toList());
 
-            if (deductSucceed) {
-                results.add(StockDeductResult.success(request.getProductUUID(), product.getStockQuantity()));
-            } else {
-                results.add(StockDeductResult.failed(request.getProductUUID()));
+        List<StockRestoreResult> results = new ArrayList<>();
+        for (StockDeductHistory history : historyList) {
+            Product product = productMap.get(history.getProductUUID());
+            if (product == null) {
+                throw new IllegalStateException("cannot find product: " + history.getProductUUID());
             }
 
+            product.restoreStock(history.getQuantity());
+            history.restore();
+            results.add(new StockRestoreResult(history.getProductUUID(), history.getQuantity(), product.getStockQuantity()));
         }
 
-        boolean hasAllsuccess = results.stream().allMatch(StockDeductResult::isSuccess);
-
-        if (hasAllsuccess) {
-            eventPublisher.publishBulkStockDeduct(orderUUID, results);
-        } else {
-            eventPublisher.publishBulkStockFailed(orderUUID, results);
-        }
+        eventPublisher.publishStockRestored(orderUUID, results);
     }
 
-
-    // 단일 재고 복구
-    public void restoreStock(UUID orderUUID, UUID productUUID, int quantity) {
-        try {
-            Product product = productRepository.findByProductUUIDWithLock(productUUID)
-                    .orElseThrow(() -> new IllegalArgumentException("cannot find product: " + productUUID));
-
-            product.restoreStock(quantity);
-
-            eventPublisher.publishStockRestored(orderUUID, productUUID, quantity, product.getStockQuantity());
-
-        } catch (Exception e) {
-            log.error("Fail to restore stock: productUUID={}, error={}", productUUID, e.getMessage());
-            throw new RuntimeException("Fail to restore stock");
+    private boolean isDeductedOrder(UUID orderUUID) {
+        if (historyRepository.existsByOrderUUID(orderUUID)) {
+            log.info("Skip duplicated deduction: orderUUID={}", orderUUID);
+            return true;
         }
+        return false;
     }
 
-    // 여러 상품 재고 복구
-    public void restoreStocks(List<StockDeductRequest> requests, UUID orderUUID) {
-        for (StockDeductRequest request : requests) {
-            restoreStock(orderUUID, request.getProductUUID(), request.getQuantity());
+    private StockDeductResult checkStock(Product product, StockDeductRequest request) {
+        if (product == null) {
+            return StockDeductResult.failed(request.getProductUUID(), request.getQuantity(), 0);
         }
+        if (!product.canDeductStock(request.getQuantity())) {
+            return StockDeductResult.failed(request.getProductUUID(), request.getQuantity(), product.getStockQuantity());
+        }
+        return StockDeductResult.success(request.getProductUUID(), request.getQuantity(), product.getStockQuantity());
+    }
+
+    private StockDeductResult deductAndRecord(Product product, int quantity, UUID orderUUID) {
+        product.deductStock(quantity);
+        historyRepository.save(StockDeductHistory.of(orderUUID, product.getProductUUID(), quantity));
+        return StockDeductResult.success(product.getProductUUID(), quantity, product.getStockQuantity());
+    }
+
+    // 데드락 방지를 위해 정렬 후 락
+    private Map<UUID, Product> findProductMapWithLock(List<UUID> productUUIDs) {
+        if (productUUIDs.isEmpty()) {
+            return Map.of();
+        }
+        List<UUID> sortedUUIDs = productUUIDs.stream().distinct().sorted().toList();
+        return productRepository.findByProductUUIDsWithLock(sortedUUIDs).stream()
+                .collect(Collectors.toMap(Product::getProductUUID, Function.identity()));
+    }
+
+    // 같은 상품이 여러 줄이면 수량 합산
+    private List<StockDeductRequest> mergeByProduct(List<StockDeductRequest> requests) {
+        Map<UUID, Integer> quantityMap = requests.stream()
+                .collect(Collectors.toMap(StockDeductRequest::getProductUUID, StockDeductRequest::getQuantity, Integer::sum, LinkedHashMap::new));
+        return quantityMap.entrySet().stream()
+                .map(entry -> new StockDeductRequest(entry.getKey(), entry.getValue()))
+                .toList();
     }
 
 }

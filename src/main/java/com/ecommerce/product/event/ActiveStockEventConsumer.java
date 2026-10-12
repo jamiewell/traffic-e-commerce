@@ -1,9 +1,13 @@
 package com.ecommerce.product.event;
 
+import com.ecommerce.config.EventTypes;
+import com.ecommerce.config.KafkaTopics;
 import com.ecommerce.product.dto.request.StockDeductRequest;
 import com.ecommerce.product.productService.ProductService;
-import com.ecommerce.proto.StockDeductEvent;
-import com.ecommerce.proto.StockRestoredEvent;
+import com.ecommerce.proto.DeductItem;
+import com.ecommerce.proto.SagaStockCheckEvent;
+import com.ecommerce.proto.SagaStockDeductEvent;
+import com.ecommerce.proto.SagaStockRestoreEvent;
 import com.google.protobuf.InvalidProtocolBufferException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,8 +18,8 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
+// 예외는 던져서 컨테이너 에러 핸들러가 재시도하도록 함
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -23,74 +27,62 @@ public class ActiveStockEventConsumer {
 
     private final ProductService productService;
 
-    @KafkaListener(topics = "product-events", groupId = "product-service")
+    @KafkaListener(topics = KafkaTopics.PRODUCT_COMMANDS, groupId = KafkaTopics.PRODUCT_SERVICE_GROUP)
     public void consumeOrderEvents(ConsumerRecord<String, byte[]> record, Acknowledgment ack) {
-        try {
-            String key = record.key();
-            byte[] value = record.value();
-            log.info("Stock consume: order key={}", key);
+        String eventType = EventTypes.resolveEventType(record);
+        byte[] value = record.value();
+        log.info("Stock consume: eventType={}, key={}", eventType, record.key());
 
-            switch (key) {
-                case "stock.check"  :  operateStockCheck(value);
-                case "stock.deduct" :  operateStockDeduction(value);
-                case "stock.restore":  operateStockRestoration(value);
-                break;
-            }
-            ack.acknowledge();
-        } catch (Exception e) {
-            log.error("Stock error : consume order event {}", e.getMessage());
+        switch (eventType) {
+            case EventTypes.STOCK_CHECK -> operateStockCheck(value);
+            case EventTypes.STOCK_DEDUCT -> operateStockDeduction(value);
+            case EventTypes.STOCK_BULK_DEDUCT -> operateBulkStockDeduction(value);
+            case EventTypes.STOCK_RESTORE -> operateStockRestoration(value);
+            default -> log.debug("Stock skip event : {}", eventType);
         }
+        ack.acknowledge();
     }
 
     private void operateStockCheck(byte[] value) {
-
-        try {
-            StockDeductEvent deductEvent = StockDeductEvent.parseFrom(value);
-
-            List<StockDeductRequest> checkRequest = deductEvent.getItemsList().stream()
-                    .map(item -> new StockDeductRequest(UUID.fromString(item.getProductUuid()), item.getDeductQuantity()))
-                    .collect(Collectors.toList());
-
-            productService.hasStockActive(checkRequest);
-        } catch (InvalidProtocolBufferException e) {
-            log.error("Parsing stock check error: {}", e.getMessage());
-        } catch (RuntimeException e) {
-            log.error("Stock check error: {}", e.getMessage());
-        }
+        SagaStockCheckEvent checkEvent = parse(() -> SagaStockCheckEvent.parseFrom(value), "stock check");
+        productService.hasStockActive(toRequestList(checkEvent.getItemsList()), UUID.fromString(checkEvent.getOrderUuid()));
     }
 
     private void operateStockDeduction(byte[] value) {
+        SagaStockDeductEvent deductEvent = parse(() -> SagaStockDeductEvent.parseFrom(value), "stock deduct");
+        DeductItem item = deductEvent.getItems(0);
+        productService.deductStock(UUID.fromString(item.getProductUuid()), item.getDeductQuantity(), UUID.fromString(deductEvent.getOrderUuid()));
+    }
+
+    private void operateBulkStockDeduction(byte[] value) {
+        SagaStockDeductEvent deductEvent = parse(() -> SagaStockDeductEvent.parseFrom(value), "stock bulk deduct");
+        productService.deductStocks(toRequestList(deductEvent.getItemsList()), UUID.fromString(deductEvent.getOrderUuid()));
+    }
+
+    // 복구 수량은 Product 의 차감 이력 기준
+    private void operateStockRestoration(byte[] value) {
+        SagaStockRestoreEvent restoreEvent = parse(() -> SagaStockRestoreEvent.parseFrom(value), "stock restore");
+        productService.restoreStocks(UUID.fromString(restoreEvent.getOrderUuid()));
+    }
+
+    private List<StockDeductRequest> toRequestList(List<DeductItem> items) {
+        return items.stream()
+                .map(item -> new StockDeductRequest(UUID.fromString(item.getProductUuid()), item.getDeductQuantity()))
+                .toList();
+    }
+
+    private <T> T parse(ProtoParser<T> parser, String eventName) {
         try {
-            StockDeductEvent deductEvent = StockDeductEvent.parseFrom(value);
-            UUID orderUUID = UUID.fromString(deductEvent.getOrderUuid());
-
-            List<StockDeductRequest> deductReqList = deductEvent.getItemsList().stream()
-                    .map(item -> new StockDeductRequest(UUID.fromString(item.getProductUuid()), item.getDeductQuantity()))
-                    .collect(Collectors.toList());
-            productService.deductStocks(deductReqList, orderUUID);
-
+            return parser.parse();
         } catch (InvalidProtocolBufferException e) {
-            log.error("Parsing deduction error: {}", e.getMessage());
-        } catch (RuntimeException e) {
-            log.error("Stock deduction error: {}", e.getMessage());
+            log.error("Parsing {} error: {}", eventName, e.getMessage());
+            throw new IllegalArgumentException("Failed to parse " + eventName, e);
         }
     }
 
-    private void operateStockRestoration(byte[] value) {
-        try {
-            StockRestoredEvent restoreEvent = StockRestoredEvent.parseFrom(value);
-            UUID orderUUID = UUID.fromString(restoreEvent.getOrderUuid());
-
-            List<StockDeductRequest> restoreReqList = restoreEvent.getItemsList().stream()
-                    .map(item -> new StockDeductRequest(UUID.fromString(item.getProductUuid()), item.getRestoredQuantity()))
-                    .collect(Collectors.toList());
-            productService.restoreStocks(restoreReqList, orderUUID);
-
-        } catch (InvalidProtocolBufferException e) {
-            log.error("Parsing restoration error: {}", e.getMessage());
-        } catch (RuntimeException e) {
-            log.error("Stock restoration error: {}", e.getMessage());
-        }
+    @FunctionalInterface
+    private interface ProtoParser<T> {
+        T parse() throws InvalidProtocolBufferException;
     }
 
 }

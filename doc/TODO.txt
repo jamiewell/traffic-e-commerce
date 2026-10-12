@@ -80,7 +80,7 @@
  2. 메시지 유실 / 무한 루프 (P0) - 빌드가 되더라도 흐름 테스트 전에 반드시 수정
 ================================================================================
 
-[~] 2-1. 컨슈머 그룹 충돌  ★ 가장 심각  -> Order 완료
+[~] 2-1. 컨슈머 그룹 충돌  ★ 가장 심각  -> Order, Product 완료
       - order/event/saga/OrderSagaEventConsumer 가 다른 도메인의 groupId 를 그대로 사용
           product-events  : groupId "product-service"  -> ActiveStockEventConsumer 와 같은 그룹
           shipment-events : groupId "shipment-service" -> ShipmentEventConsumer 와 같은 그룹
@@ -90,7 +90,7 @@
         -> 재고 요청이 오케스트레이터로, 재고 결과가 상품 컨슈머로 가는 식으로 엉뚱한 곳에서 소비됨
       - 오케스트레이터 전용 그룹(예: "order-saga") 으로 분리
 
-[~] 2-2. switch fall-through (break 누락)  -> Order 완료
+[~] 2-2. switch fall-through (break 누락)  -> Order, Product 완료
       - OrderSagaEventConsumer : consumeOrderEvents / consumeProductEvents / consumePaymentEvents 의 switch
           order.created   -> 사가 시작 후 취소 처리까지 실행
           payment.success -> 성공/실패/취소 핸들러 모두 실행
@@ -112,7 +112,7 @@
       - OrderEventConsumer.createOrderEvent 는 내용이 주석 처리된 상태
       - 하나로 통합 (오케스트레이터 쪽 유지 권장), 빈 클래스 OrderEventPublisher 정리
 
-[~] 2-5. 요청(command) 과 결과(event) 가 같은 토픽에 섞여 있음  -> Order 발행측 완료
+[~] 2-5. 요청(command) 과 결과(event) 가 같은 토픽에 섞여 있음  -> Order, Product 완료
       - product-events : 오케스트레이터의 stock.check / stock.deduct 요청 + 상품의 stock.* 결과
       - shipment-events : 오케스트레이터의 shipment.requested 요청 + 배송의 shipment.* 결과
       - 2-1 을 고쳐도 각 컨슈머가 자신과 무관한 키를 계속 받게 됨
@@ -131,10 +131,10 @@
         -> 메시지 수신 시 예외
       - 팩토리를 하나로 통합(빈 이름 kafkaListenerContainerFactory), ack 정책을 정하고 모든 컨슈머에 동일 적용
 
-[ ] 3-2. ProductRepository ID 타입 오류
+[x] 3-2. ProductRepository ID 타입 오류
       - JpaRepository<Product, String> -> Product.id 는 long 이므로 <Product, Long>
 
-[~] 3-3. 트랜잭션 어노테이션 통일  -> Order 완료
+[~] 3-3. 트랜잭션 어노테이션 통일  -> Order, Product 완료
       - OrderSagaOrchestrator, ShipmentService, ProductService 가 jakarta.transaction.Transactional 사용
       - org.springframework.transaction.annotation.Transactional 로 통일
 
@@ -219,30 +219,33 @@
       - 사가 상태 변경 메서드 일부가 currentStep 만 바꾸고 sagaStatus 는 그대로 (requestStockQtyChecked 등)
 
 ---------------------------------------- 4-B. Product
-[ ] 4-B-1. 재고 차감/복구에 트랜잭션 없음  ★ 재고 단계가 진행되지 않는 원인
+[x] 4-B-1. 재고 차감/복구에 트랜잭션 없음  ★ 재고 단계가 진행되지 않는 원인
       - ProductService.deductStock / deductStocks / restoreStock / restoreStocks
       - PESSIMISTIC_WRITE 락을 트랜잭션 밖에서 실행 -> TransactionRequiredException
         (예외가 안 나도 락 즉시 해제 + dirty checking 미동작 -> 차감 미반영)
       - Spring @Transactional 추가
 
-[ ] 4-B-2. 벌크 차감 부분 실패 시 롤백 안 됨
+[x] 4-B-2. 벌크 차감 부분 실패 시 롤백 안 됨  -> 전부 확인 후 차감 (부족하면 차감 없음)
       - deductStocks : 일부만 성공해도 성공분 차감이 남음 -> 하나라도 실패하면 예외로 전체 롤백
       - productMap.get() 이 null(없는 상품)일 때 NPE 처리
 
-[ ] 4-B-3. hasStockActive() 로직 오류 (확인 단계 유지 결정 -> 필수)
+[x] 4-B-3. hasStockActive() 로직 오류 (확인 단계 유지 결정 -> 필수)
       - productList.size() (상품 개수) 를 요청 수량과 비교 -> 재고 수량(stockQuantity) 과 비교해야 함
       - 하나라도 부족하면 false 여야 하는데, 조건이 반대로 되어 있음
       - publishStockActive() 가 orderUUID 와 결과 값을 담지 않은 빈 메시지를 발행
 
-[ ] 4-B-4. 이벤트 데이터 오류
+[x] 4-B-4. 이벤트 데이터 오류
       - publishBulkStockDeduct : deductQuantity 에 remainingStock 을 넣음
       - publishBulkStockFailed : requestedQuantity 를 0 으로 고정
       - StockDeductResult 에 요청 수량을 담아 올바르게 채우기
 
-[ ] 4-B-5. 메시지 타입 불일치 (현재는 필드 번호가 같아서 우연히 동작)
+[x] 4-B-5. 메시지 타입 불일치 (현재는 필드 번호가 같아서 우연히 동작)
       - 오케스트레이터는 SagaStockDeductEvent / SagaStockRestoreEvent 로 발행,
         상품은 StockDeductEvent / StockRestoredEvent 로 파싱
       - 요청 메시지와 결과 메시지를 명확히 구분해 같은 타입으로 발행/파싱
+
+[x] 4-B-6. 재고 중복 차감/복구 방지
+      - StockDeductHistory(주문별 차감 이력) : 이력 있으면 차감 무시, 복구는 미복구 이력 수량 기준
 
 ---------------------------------------- 4-C. Payment
 [ ] 4-C-1. 결제 대기 생성 실패
@@ -300,18 +303,18 @@
  5. Kafka 컨슈머 공통 (P1~P2)
 ================================================================================
 
-[ ] 5-1. 예외를 catch 후 로그만 남기고 삼킴 (모든 컨슈머)
+[~] 5-1. 예외를 catch 후 로그만 남기고 삼킴 (모든 컨슈머)  -> Order, Product 완료
       - 실패해도 오프셋이 커밋되어 메시지 유실
       - MVP: DefaultErrorHandler + FixedBackOff 로 재시도 후 로그
       - 이후: DeadLetterPublishingRecoverer 로 DLT 전송
 
-[ ] 5-2. ack 정책 통일 (3-1 과 함께)
+[~] 5-2. ack 정책 통일 (3-1 과 함께)  -> Order, Product 완료
       - ActiveStockEventConsumer 만 수동 ack, 내부에서 예외를 삼키므로 실패해도 ack 됨
 
-[ ] 5-3. 프로듀서 전송 결과 확인
+[~] 5-3. 프로듀서 전송 결과 확인  -> KafkaEventSender 사용 도메인(Order, Product) 완료
       - kafkaTemplate.send(...) 의 결과(CompletableFuture) 를 확인하지 않음 -> 최소한 whenComplete 로 실패 로그
 
-[ ] 5-4. switch 의 key 가 null 이면 NPE (record.key() null 방어)
+[~] 5-4. switch 의 key 가 null 이면 NPE (record.key() null 방어)  -> Order, Product 완료
 
 
 ================================================================================

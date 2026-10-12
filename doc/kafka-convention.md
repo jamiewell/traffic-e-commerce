@@ -66,6 +66,7 @@
   - 배치 차감은 전부 성공하거나 전부 실패합니다. 하나라도 부족하면 전체를 롤백하고 `stock.bulk.lacked`를 발행합니다.
   - `stock.check`는 미리 확인만 하고 재고를 예약하지 않습니다. 실제 보장은 차감할 때 비관적 락 안에서 다시 검사해서 얻습니다.
   - `stock.check.response`에는 `orderUUID`와 확인 결과가 들어가야 합니다. 그래서 전용 메시지를 새로 만듭니다.
+  - Product는 주문별 차감 이력(`StockDeductHistory`)으로 중복 차감을 무시하고, `stock.restore`는 요청 수량이 아니라 미복구 이력 수량으로 복구합니다.
 - `order.cancelled`를 받은 오케스트레이터는 보상 요청만 보내고, `order.cancelled`를 다시 발행하지 않습니다 (취소 루프 방지).
 
 ## 4. 보상 규칙
